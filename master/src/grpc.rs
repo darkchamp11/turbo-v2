@@ -134,27 +134,75 @@ impl WorkerService for WorkerServiceImpl {
 }
 
 async fn handle_compile_result(state: &AppState, result: common::scheduler::CompileResult) {
-    if let Some(mut job) = state.jobs.get_mut(&result.job_id) {
-        job.compiler_output = Some(result.compiler_output.clone());
+    let job_id = result.job_id.clone();
+    
+    // First, update the job with compile result
+    let dispatch_info = {
+        if let Some(mut job) = state.jobs.get_mut(&job_id) {
+            job.compiler_output = Some(result.compiler_output.clone());
 
-        if result.success {
-            job.binary = Some(result.binary_payload);
-            // TODO: Trigger Phase 2 - batch execution
-            info!(job_id = %result.job_id, "Compilation successful, ready for execution phase");
-        } else {
-            // Compilation failed - complete the job with error
-            job.state = JobState::Completed;
-
-            if let Some(responder) = job.responder.take() {
-                let _ = responder.send(FinalResponse {
-                    job_id: result.job_id,
-                    success: false,
-                    results: vec![],
-                    compiler_output: Some(result.compiler_output),
-                    error: Some("Compilation failed".to_string()),
-                });
+            if result.success {
+                job.binary = Some(result.binary_payload.clone());
+                job.state = JobState::Executing { pending_batches: 1 };
+                
+                // Gather info needed for dispatch
+                Some((
+                    job.language.clone(),
+                    result.binary_payload.clone(),
+                    job.test_cases.clone(),
+                    job.time_limit_ms,
+                    job.memory_limit_mb,
+                ))
+            } else {
+                // Compilation failed - complete the job with error
+                job.state = JobState::Completed;
+                None
             }
+        } else {
+            None
         }
+    };
+
+    // Dispatch execution if compilation succeeded
+    if let Some((language, binary, test_cases, time_limit, memory_limit)) = dispatch_info {
+        info!(job_id = %job_id, "Compilation successful, dispatching execution phase");
+
+        // Find a worker to execute
+        let worker_id = state
+            .workers
+            .iter()
+            .min_by(|a, b| {
+                a.value()
+                    .cpu_load_percent
+                    .partial_cmp(&b.value().cpu_load_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|entry| entry.key().clone());
+
+        if let Some(worker_id) = worker_id {
+            let task = common::scheduler::ExecuteBatchTask {
+                job_id: job_id.clone(),
+                batch_id: "batch_1".to_string(),
+                language,
+                payload: Some(common::scheduler::execute_batch_task::Payload::BinaryArtifact(binary)),
+                inputs: test_cases,
+                time_limit_ms: time_limit,
+                memory_limit_mb: memory_limit,
+            };
+
+            let cmd = MasterCommand {
+                task: Some(common::scheduler::master_command::Task::Execute(task)),
+            };
+
+            if let Some(worker) = state.workers.get(&worker_id) {
+                let _ = worker.sender.send(Ok(cmd)).await;
+                info!(job_id = %job_id, worker_id = %worker_id, "Dispatched execute task with binary");
+            }
+        } else {
+            warn!(job_id = %job_id, "No workers available for execution phase");
+        }
+    } else {
+        info!(job_id = %job_id, "Compilation failed");
     }
 }
 

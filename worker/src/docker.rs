@@ -42,12 +42,12 @@ impl DockerExecutor {
             "cpp" | "c++" => (
                 "gcc:latest",
                 "main.cpp",
-                format!("g++ {} -o /tmp/main /tmp/main.cpp", flags.join(" ")),
+                format!("g++ -static {} -o /tmp/main /tmp/main.cpp", flags.join(" ")),
             ),
             "c" => (
                 "gcc:latest",
                 "main.c",
-                format!("gcc {} -o /tmp/main /tmp/main.c", flags.join(" ")),
+                format!("gcc -static {} -o /tmp/main /tmp/main.c", flags.join(" ")),
             ),
             "rust" => (
                 "rust:latest",
@@ -62,8 +62,11 @@ impl DockerExecutor {
             "java" => (
                 "eclipse-temurin:25",
                 "Main.java",
-                // Compile and create a simple wrapper script
-                "javac /tmp/Main.java -d /tmp && echo '#!/bin/sh\njava -cp /tmp Main' > /tmp/main && chmod +x /tmp/main".to_string(),
+                // Compile to /tmp/classes, then create tarball with classes and wrapper script
+                "mkdir -p /tmp/classes && javac /tmp/Main.java -d /tmp/classes && \
+                 cd /tmp && tar -cf /tmp/java_bundle.tar -C /tmp/classes . && \
+                 echo '#!/bin/sh\njava -cp /tmp/classes Main' > /tmp/main && chmod +x /tmp/main && \
+                 tar -rf /tmp/java_bundle.tar -C /tmp main".to_string(),
             ),
             _ => {
                 return CompileResult {
@@ -164,8 +167,14 @@ impl DockerExecutor {
         };
 
         // Download binary if successful
+        // For Java, download the bundle tarball instead of just the wrapper
         let binary_payload = if success {
-            self.download_file(&container_name, "/tmp/main")
+            let download_path = if language.to_lowercase() == "java" {
+                "/tmp/java_bundle.tar"
+            } else {
+                "/tmp/main"
+            };
+            self.download_file(&container_name, download_path)
                 .await
                 .unwrap_or_default()
         } else {
@@ -307,22 +316,46 @@ impl DockerExecutor {
                     .await;
             }
         } else if let Some(bin) = binary {
-            let tar_data = create_tar_archive_executable("main", bin);
-            let _ = self
-                .docker
-                .upload_to_container(
-                    &container_name,
-                    Some(UploadToContainerOptions {
-                        path: "/tmp",
-                        ..Default::default()
-                    }),
-                    tar_data.into(),
-                )
-                .await;
-            // Make executable
-            let _ = self
-                .exec_in_container(&container_name, "chmod +x /tmp/main", Duration::from_secs(5))
-                .await;
+            // For Java, the binary is actually a tarball containing classes and wrapper
+            if is_java {
+                // Upload the tarball directly (it's already a tar archive)
+                let _ = self
+                    .docker
+                    .upload_to_container(
+                        &container_name,
+                        Some(UploadToContainerOptions {
+                            path: "/tmp",
+                            ..Default::default()
+                        }),
+                        bin.to_vec().into(),
+                    )
+                    .await;
+                // Extract the bundle: creates /tmp/classes/* and /tmp/main
+                let _ = self
+                    .exec_in_container(
+                        &container_name,
+                        "mkdir -p /tmp/classes && cd /tmp && tar -xf /tmp/java_bundle.tar && chmod +x /tmp/main",
+                        Duration::from_secs(10),
+                    )
+                    .await;
+            } else {
+                let tar_data = create_tar_archive_executable("main", bin);
+                let _ = self
+                    .docker
+                    .upload_to_container(
+                        &container_name,
+                        Some(UploadToContainerOptions {
+                            path: "/tmp",
+                            ..Default::default()
+                        }),
+                        tar_data.into(),
+                    )
+                    .await;
+                // Make executable
+                let _ = self
+                    .exec_in_container(&container_name, "chmod +x /tmp/main", Duration::from_secs(5))
+                    .await;
+            }
         }
 
         // Execute each test case
@@ -360,7 +393,17 @@ impl DockerExecutor {
                     let actual_output = stdout.trim();
                     let expected_output = tc.expected_output.trim();
 
-                    let status = if exit_code != 0 {
+                    // Detect Memory Limit Exceeded:
+                    // - Exit code 137 = 128 + 9 (SIGKILL from OOM killer)
+                    // - "Killed" in output indicates OOM
+                    let is_mle = exit_code == 137
+                        || stdout.contains("Killed")
+                        || stderr.contains("Killed")
+                        || stderr.contains("Out of memory");
+
+                    let status = if is_mle {
+                        "MLE" // Memory Limit Exceeded
+                    } else if exit_code != 0 {
                         "RE" // Runtime Error
                     } else if actual_output == expected_output {
                         "PASSED"

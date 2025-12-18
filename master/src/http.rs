@@ -90,7 +90,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/submit", post(submit_job))
-        .route("/status/{job_id}", get(get_job_status))
+        .route("/status/:job_id", get(get_job_status))
         .route("/workers", get(list_workers))
         .with_state(state)
 }
@@ -112,8 +112,45 @@ async fn submit_job(
         "Job submitted"
     );
 
+    // Check if we have any available workers
+    if state.workers.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitResponse {
+                job_id: job_id.clone(),
+                message: "No workers available".to_string(),
+            }),
+        );
+    }
+
+    // Determine if language is interpreted or compiled
+    let is_interpreted = matches!(
+        req.language.to_lowercase().as_str(),
+        "python" | "python3" | "javascript" | "js" | "node" | "ruby"
+    );
+
+    // Convert test cases to protobuf format
+    let proto_test_cases: Vec<common::scheduler::TestCase> = req
+        .test_cases
+        .iter()
+        .map(|tc| common::scheduler::TestCase {
+            id: tc.id.clone(),
+            input: tc.input.clone(),
+            expected_output: tc.expected_output.clone(),
+        })
+        .collect();
+
     // Create oneshot channel for response
     let (tx, _rx) = oneshot::channel::<FinalResponse>();
+
+    // Determine initial state based on language type
+    let initial_state = if is_interpreted {
+        JobState::Executing {
+            pending_batches: 1, // Single batch for now
+        }
+    } else {
+        JobState::Compiling
+    };
 
     // Create job context
     let job = JobContext {
@@ -122,34 +159,87 @@ async fn submit_job(
         source_code: req.source_code.clone(),
         total_test_cases: req.test_cases.len(),
         results: vec![],
-        state: JobState::Compiling,
+        state: initial_state,
         binary: None,
         compiler_output: None,
         responder: Some(tx),
+        test_cases: proto_test_cases.clone(),
+        time_limit_ms: req.time_limit_ms,
+        memory_limit_mb: req.memory_limit_mb,
     };
 
     // Store job
     state.jobs.insert(job_id.clone(), job);
 
-    // Check if we have any available workers
-    if state.workers.is_empty() {
+    // Find a suitable worker (least loaded)
+    let worker_id = state
+        .workers
+        .iter()
+        .min_by(|a, b| {
+            a.value()
+                .cpu_load_percent
+                .partial_cmp(&b.value().cpu_load_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|entry| entry.key().clone());
+
+    let Some(worker_id) = worker_id else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitResponse {
-                job_id: job_id.clone(),
-                message: "No workers available. Job queued.".to_string(),
+                job_id,
+                message: "No workers available".to_string(),
             }),
         );
-    }
+    };
 
-    // TODO: Dispatch to worker based on language
-    // For now, just acknowledge receipt
+    // Dispatch to worker
+    if is_interpreted {
+        // For interpreted languages, send ExecuteBatchTask directly
+        let task = common::scheduler::ExecuteBatchTask {
+            job_id: job_id.clone(),
+            batch_id: "batch_1".to_string(),
+            language: req.language.clone(),
+            payload: Some(common::scheduler::execute_batch_task::Payload::SourceCode(
+                req.source_code.clone(),
+            )),
+            inputs: proto_test_cases,
+            time_limit_ms: req.time_limit_ms,
+            memory_limit_mb: req.memory_limit_mb,
+        };
+
+        let cmd = common::scheduler::MasterCommand {
+            task: Some(common::scheduler::master_command::Task::Execute(task)),
+        };
+
+        if let Some(worker) = state.workers.get(&worker_id) {
+            let _ = worker.sender.send(Ok(cmd)).await;
+            info!(job_id = %job_id, worker_id = %worker_id, "Dispatched execute task");
+        }
+    } else {
+        // For compiled languages, send CompileTask first
+        let task = common::scheduler::CompileTask {
+            job_id: job_id.clone(),
+            language: req.language.clone(),
+            source_code: req.source_code.clone(),
+            flags: req.compiler_flags.clone(),
+        };
+
+        let cmd = common::scheduler::MasterCommand {
+            task: Some(common::scheduler::master_command::Task::Compile(task)),
+        };
+
+        if let Some(worker) = state.workers.get(&worker_id) {
+            let _ = worker.sender.send(Ok(cmd)).await;
+            info!(job_id = %job_id, worker_id = %worker_id, "Dispatched compile task");
+        }
+    }
 
     (
         StatusCode::ACCEPTED,
         Json(SubmitResponse {
             job_id,
-            message: "Job accepted and queued for execution".to_string(),
+            message: "Job accepted and dispatched for execution".to_string(),
         }),
     )
 }

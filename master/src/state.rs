@@ -43,6 +43,12 @@ pub struct JobContext {
     pub compiler_output: Option<String>,
     /// Channel to reply to the HTTP thread once done
     pub responder: Option<oneshot::Sender<FinalResponse>>,
+    /// Test cases for this job
+    pub test_cases: Vec<common::scheduler::TestCase>,
+    /// Time limit per test case in milliseconds
+    pub time_limit_ms: u32,
+    /// Memory limit per test case in MB
+    pub memory_limit_mb: u32,
 }
 
 /// Worker connection info
