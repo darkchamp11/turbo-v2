@@ -207,7 +207,7 @@ impl DockerExecutor {
         memory_limit_mb: u32,
     ) -> BatchExecutionResult {
         let mut results = Vec::new();
-        let mut peak_ram: u64 = 0;
+        let peak_ram: u64 = 0;
         let mut total_cpu_time: u64 = 0;
 
         // Determine execution method based on language

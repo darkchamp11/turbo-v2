@@ -6,7 +6,7 @@ use crate::state::AppState;
 use common::scheduler::{
     execute_batch_task, CompileTask, ExecuteBatchTask, MasterCommand, TestCase,
 };
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// Batch size for distributing test cases
 const BATCH_SIZE: usize = 20;

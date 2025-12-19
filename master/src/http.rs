@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use common::scheduler::{TestCaseResult, TestCase as ProtoTestCase};
+use common::scheduler::TestCaseResult;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::info;
