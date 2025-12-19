@@ -16,7 +16,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 
-const DEFAULT_MASTER_ADDR: &str = "http://127.0.0.1:50051";
+const DEFAULT_MASTER_ADDR: &str = "http://172.16.7.253:50051";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
